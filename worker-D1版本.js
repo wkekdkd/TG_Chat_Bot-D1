@@ -9,6 +9,8 @@
  * [新增] 完整的管理员配置菜单。
  * [新增] 备份群组功能：配置一个群组，用于接收所有用户消息的副本，不参与回复。
  * [新增] 协管员授权功能：允许设置额外的管理员ID，他们可以绕过私聊验证并回复用户消息。
+ * [优化 1] 新增用户和管理员的消息发送回执功能。
+ * [优化 2] 新增用户验证通过后，首条消息必须为纯文本的限制。
  * * 部署要求: 
  * 1. D1 数据库绑定，名称必须为 'TG_BOT_DB'。
  * 2. 环境变量 ADMIN_IDS, BOT_TOKEN, ADMIN_GROUP_ID, 等不变。
@@ -43,7 +45,8 @@ async function dbUserGetOrCreate(userId, env) {
     if (!user) {
         // 插入默认记录
         await env.TG_BOT_DB.prepare(
-            "INSERT INTO users (user_id, user_state, is_blocked, block_count) VALUES (?, 'new', 0, 0)"
+            // [优化 2] 默认记录中包含 first_message_sent
+            "INSERT INTO users (user_id, user_state, is_blocked, block_count, first_message_sent) VALUES (?, 'new', 0, 0, 0)"
         ).bind(userId).run();
         // 重新查询以获取完整的默认记录
         user = await env.TG_BOT_DB.prepare("SELECT * FROM users WHERE user_id = ?").bind(userId).first();
@@ -52,6 +55,7 @@ async function dbUserGetOrCreate(userId, env) {
     // 将 is_blocked 转换为布尔值，并解析 JSON 字段
     if (user) {
         user.is_blocked = user.is_blocked === 1;
+        user.first_message_sent = user.first_message_sent === 1; // [优化 2] 转换布尔值
         user.user_info = user.user_info_json ? JSON.parse(user.user_info_json) : null;
     }
     return user;
@@ -70,16 +74,16 @@ async function dbUserUpdate(userId, data, env) {
     
     // 构造 SQL 语句
     const fields = Object.keys(data).map(key => {
-        // 特殊处理 is_blocked (布尔值) 和 block_count (数字)
-        if (key === 'is_blocked' && typeof data[key] === 'boolean') {
-             return 'is_blocked = ?'; // D1 存储 0/1
+        // 特殊处理布尔值
+        if ((key === 'is_blocked' || key === 'first_message_sent') && typeof data[key] === 'boolean') {
+             return `${key} = ?`; // D1 存储 0/1
         }
         return `${key} = ?`;
     }).join(', ');
     
     // 构造值数组
     const values = Object.keys(data).map(key => {
-         if (key === 'is_blocked' && typeof data[key] === 'boolean') {
+         if ((key === 'is_blocked' || key === 'first_message_sent') && typeof data[key] === 'boolean') {
              return data[key] ? 1 : 0;
          }
          return data[key];
@@ -160,12 +164,14 @@ async function dbMigrate(env) {
     `;
 
     // users 表 (存储用户状态、话题ID、屏蔽状态和用户信息)
+    // [优化 2] 新增 first_message_sent 字段，用于限制首条消息类型
     const usersTableQuery = `
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY NOT NULL,
             user_state TEXT NOT NULL DEFAULT 'new',
             is_blocked INTEGER NOT NULL DEFAULT 0,
             block_count INTEGER NOT NULL DEFAULT 0,
+            first_message_sent INTEGER NOT NULL DEFAULT 0,
             topic_id TEXT,
             user_info_json TEXT 
         );
@@ -488,6 +494,23 @@ async function handlePrivateMessage(message, env) {
         await handleVerification(chatId, text, env);
     } else if (userState === "verified") {
         
+        // --- [优化 2] 首次消息纯文本检查 ---
+        if (!user.first_message_sent) { 
+            const isPureText = message.text && !message.photo && !message.video && !message.document &&
+                               !message.sticker && !message.audio && !message.voice &&
+                               !message.forward_from_chat && !message.forward_from && !message.animation;
+
+            if (!isPureText) {
+                await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                    chat_id: chatId,
+                    text: "⚠️ 验证通过后，您的第一条消息必须是纯文本内容。请重新发送。",
+                });
+                return; // 阻止非文本的首次消息
+            }
+            // 如果是纯文本，则正常向下执行，状态将在成功发送后更新
+        }
+        // --- [优化 2] 结束 ---
+
         // --- [关键词屏蔽检查] ---
         const blockKeywords = await getBlockKeywords(env); // 获取 JSON 数组
         const blockThreshold = parseInt(await getConfig('block_threshold', env, "5"), 10) || 5; 
@@ -684,9 +707,10 @@ async function handleVerification(chatId, answer, env) {
     if (answer.trim() === expectedAnswer.trim()) {
         await telegramApi(env.BOT_TOKEN, "sendMessage", {
             chat_id: chatId,
-            text: "✅ 验证通过！您现在可以发送消息了。",
+            text: "✅ 验证通过！您现在可以发送消息了。\n\n**注意：您的第一条消息必须是纯文本内容。**",
+            parse_mode: "Markdown",
         });
-        // 更新 D1 中的用户状态
+        // 更新 D1 中的用户状态, first_message_sent 保持默认的 0/false
         await dbUserUpdate(chatId, { user_state: "verified" }, env);
     } else {
         await telegramApi(env.BOT_TOKEN, "sendMessage", {
@@ -1118,7 +1142,7 @@ async function handleAdminTypeBlockMenu(chatId, messageId, env) {
             
             // 现有的过滤类型
             [{ text: `图片/视频/文件 (Photo/Video/Doc): ${statusToText(mediaStatus)}`, callback_data: statusToCallback('enable_image_forwarding', mediaStatus) }],
-            [{ text: `频道转发消息 (Channel Forward): ${statusToText(channelForwardStatus)}`, callback_data: statusToCallback('enable_channel_forwarding', channelForwardStatus) }],
+            [{ text: `频道转发消息 (Channel Forward): ${statusToCallback('enable_channel_forwarding', channelForwardStatus)}`, callback_data: statusToCallback('enable_channel_forwarding', channelForwardStatus) }],
             [{ text: `链接消息 (URL/TextLink): ${statusToText(linkStatus)}`, callback_data: statusToCallback('enable_link_forwarding', linkStatus) }],
             [{ text: `纯文本消息 (Pure Text): ${statusToText(textStatus)}`, callback_data: statusToCallback('enable_text_forwarding', textStatus) }],
 
@@ -1393,6 +1417,19 @@ async function handleRelayToTopic(message, user, env) { // 接收 user 对象
             });
             return;
         }
+    }
+
+    // --- [优化 1] 向用户发送消息送达回执 ---
+    await telegramApi(env.BOT_TOKEN, "sendMessage", {
+        chat_id: userId,
+        text: "✅ 你的消息已发送给管理员，请耐心等待回复。",
+        reply_to_message_id: message.message_id,
+        disable_notification: true,
+    }).catch(e => console.error("发送用户回执失败:", e.message)); // 忽略发送失败
+
+    // --- [优化 2] 更新用户的首次消息发送状态 ---
+    if (!user.first_message_sent) {
+        await dbUserUpdate(userId, { first_message_sent: true }, env);
     }
 
     // 存储文本消息的原始内容到 messages 表 (用于处理已编辑消息)
@@ -1936,6 +1973,17 @@ async function handleAdminReply(message, env) {
             }
         } catch (e2) {
             console.error("handleAdminReply fallback also failed:", e2?.message || e2);
+            return; // Fallback 也失败，直接退出，不发送确认消息
         }
     }
+    
+    // --- [优化 1] 向管理员发送消息送达回执 ---
+    await telegramApi(env.BOT_TOKEN, "sendMessage", {
+        chat_id: message.chat.id,
+        message_thread_id: message.message_thread_id,
+        text: `✅ 回复已发送给用户 (ID: <code>${userId}</code>)`,
+        parse_mode: "HTML",
+        reply_to_message_id: message.message_id,
+        disable_notification: true,
+    }).catch(e => console.error("发送管理员回执失败:", e.message)); // 忽略发送失败
 }
