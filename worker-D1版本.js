@@ -9,8 +9,11 @@
  * [新增] 完整的管理员配置菜单。
  * [新增] 备份群组功能：配置一个群组，用于接收所有用户消息的副本，不参与回复。
  * [新增] 协管员授权功能：允许设置额外的管理员ID，他们可以绕过私聊验证并回复用户消息。
- * [优化 1] 新增用户和管理员的消息发送回执功能。
- * [优化 2] 新增用户验证通过后，首条消息必须为纯文本的限制。
+ * [新增] 新增用户和管理员的消息发送回执功能。
+ * [新增] 新增用户验证通过后，首条消息必须为纯文本的限制。
+ * [修复漏洞] 修复了首次消息纯文本限制对链接等带实体的文本无效的问题。
+ * [新增] 将管理员回复回执中的用户ID改为可点击的用户名。
+ * [新增] 将用户资料卡中的用户名改为可点击跳转的链接。
  * * 部署要求: 
  * 1. D1 数据库绑定，名称必须为 'TG_BOT_DB'。
  * 2. 环境变量 ADMIN_IDS, BOT_TOKEN, ADMIN_GROUP_ID, 等不变。
@@ -45,7 +48,6 @@ async function dbUserGetOrCreate(userId, env) {
     if (!user) {
         // 插入默认记录
         await env.TG_BOT_DB.prepare(
-            // [优化 2] 默认记录中包含 first_message_sent
             "INSERT INTO users (user_id, user_state, is_blocked, block_count, first_message_sent) VALUES (?, 'new', 0, 0, 0)"
         ).bind(userId).run();
         // 重新查询以获取完整的默认记录
@@ -55,7 +57,7 @@ async function dbUserGetOrCreate(userId, env) {
     // 将 is_blocked 转换为布尔值，并解析 JSON 字段
     if (user) {
         user.is_blocked = user.is_blocked === 1;
-        user.first_message_sent = user.first_message_sent === 1; // [优化 2] 转换布尔值
+        user.first_message_sent = user.first_message_sent === 1;
         user.user_info = user.user_info_json ? JSON.parse(user.user_info_json) : null;
     }
     return user;
@@ -164,7 +166,6 @@ async function dbMigrate(env) {
     `;
 
     // users 表 (存储用户状态、话题ID、屏蔽状态和用户信息)
-    // [优化 2] 新增 first_message_sent 字段，用于限制首条消息类型
     const usersTableQuery = `
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY NOT NULL,
@@ -227,11 +228,16 @@ function getUserInfo(user, initialTimestamp = null) {
 
     const timestamp = initialTimestamp ? new Date(initialTimestamp * 1000).toLocaleString('zh-CN') : new Date().toLocaleString('zh-CN');
     
+    // 将用户名显示为可点击链接
+    const usernameDisplay = rawUsername !== '无' 
+        ? `<a href="tg://user?id=${userId}">${safeUsername}</a>` 
+        : `<code>${safeUsername}</code>`;
+
     const infoCard = `
 <b>👤 用户资料卡</b>
 ---
 • 昵称/名称: <code>${safeName}</code>
-• 用户名: <code>${safeUsername}</code>
+• 用户名: ${usernameDisplay}
 • ID: <code>${safeUserId}</code>
 • 首次连接时间: <code>${timestamp}</code>
     `.trim();
@@ -299,7 +305,7 @@ function isPrimaryAdmin(userId, env) {
 
 
 /**
- * [新增] 获取授权协管员 ID 列表
+ * 获取授权协管员 ID 列表
  */
 async function getAuthorizedAdmins(env) {
     const jsonString = await getConfig('authorized_admins', env, '[]');
@@ -480,12 +486,12 @@ async function handlePrivateMessage(message, env) {
         // --- 修复结束 ---
     }
     
-    // --- [新增] 协管员绕过验证逻辑 ---
+    // --- 协管员绕过验证逻辑 ---
     if (isAdmin && user.user_state !== "verified") {
         user.user_state = "verified"; 
         await dbUserUpdate(userId, { user_state: "verified" }, env); 
     }
-    // --- [新增] 协管员绕过验证逻辑结束 ---
+    // --- 协管员绕过验证逻辑结束 ---
 
     // 2. 检查用户的验证状态
     const userState = user.user_state;
@@ -494,22 +500,24 @@ async function handlePrivateMessage(message, env) {
         await handleVerification(chatId, text, env);
     } else if (userState === "verified") {
         
-        // --- [优化 2] 首次消息纯文本检查 ---
+        // --- 首次消息纯文本检查 ---
         if (!user.first_message_sent) { 
-            const isPureText = message.text && !message.photo && !message.video && !message.document &&
+            // [修复漏洞] 增强对“纯文本”的判断，拒绝任何带实体（链接、加粗、@ 等）的消息
+            const isPureText = message.text &&
+                               !message.photo && !message.video && !message.document &&
                                !message.sticker && !message.audio && !message.voice &&
-                               !message.forward_from_chat && !message.forward_from && !message.animation;
+                               !message.forward_from_chat && !message.forward_from && !message.animation &&
+                               (!message.entities || message.entities.length === 0);
 
             if (!isPureText) {
                 await telegramApi(env.BOT_TOKEN, "sendMessage", {
                     chat_id: chatId,
-                    text: "⚠️ 验证通过后，您的第一条消息必须是纯文本内容。请重新发送。",
+                    text: "⚠️ 验证通过后，您的第一条消息必须是纯文本内容（不能包含链接、加粗等格式）。请重新发送。",
                 });
-                return; // 阻止非文本的首次消息
+                return; // 阻止非纯文本的首次消息
             }
             // 如果是纯文本，则正常向下执行，状态将在成功发送后更新
         }
-        // --- [优化 2] 结束 ---
 
         // --- [关键词屏蔽检查] ---
         const blockKeywords = await getBlockKeywords(env); // 获取 JSON 数组
@@ -627,12 +635,12 @@ async function handlePrivateMessage(message, env) {
 
         // 6. 纯文本检查 (保留原逻辑)
         // 检查是否是纯文本（排除所有媒体和转发类型）
-        const isPureText = message.text && 
+        const isTextWithNoMedia = message.text && 
                            !message.photo && !message.video && !message.document && 
                            !message.sticker && !message.audio && !message.voice && 
                            !message.forward_from_chat && !message.forward_from && !message.animation; 
         
-        if (isForwardable && isPureText) {
+        if (isForwardable && isTextWithNoMedia) {
             if (!filters.text) {
                 isForwardable = false;
                 filterReason = '纯文本内容';
@@ -820,7 +828,7 @@ async function handleAdminBaseConfigMenu(chatId, messageId, env) {
 }
 
 /**
- * [新增] 协管员授权设置子菜单
+ * 协管员授权设置子菜单
  */
 async function handleAdminAuthorizedConfigMenu(chatId, messageId, env) {
     const primaryAdmins = env.ADMIN_IDS ? env.ADMIN_IDS.split(',').map(id => id.trim()).filter(id => id !== "") : [];
@@ -941,7 +949,7 @@ async function handleAdminKeywordBlockMenu(chatId, messageId, env) {
 }
 
 /**
- * [新增] 备份群组设置子菜单 - 兼容编辑和发送新消息
+ * 备份群组设置子菜单 - 兼容编辑和发送新消息
  */
 async function handleAdminBackupConfigMenu(chatId, messageId, env) {
     // 备份群组 ID 存储在 'backup_group_id' 键中
@@ -984,7 +992,7 @@ async function handleAdminBackupConfigMenu(chatId, messageId, env) {
 
 
 /**
- * [新增] 规则列表和删除界面
+ * 规则列表和删除界面
  */
 async function handleAdminRuleList(chatId, messageId, env, key) {
     let rules = [];
@@ -1067,7 +1075,7 @@ async function handleAdminRuleList(chatId, messageId, env, key) {
 }
 
 /**
- * [新增] 规则删除逻辑
+ * 规则删除逻辑
  */
 async function handleAdminRuleDelete(chatId, messageId, env, key, id) {
     let rules = [];
@@ -1186,7 +1194,7 @@ async function handleAdminConfigInput(userId, text, adminStateJson, env) {
         // 备份群组 ID 仅移除首尾空格
         } else if (adminState.key === 'backup_group_id') {
             finalValue = text.trim();
-        // [新增] 协管员授权列表处理
+        // 协管员授权列表处理
         } else if (adminState.key === 'authorized_admins') {
             // 将输入字符串按逗号分隔，并去除空格和空项，最终存储为 JSON 数组
             const adminList = text.split(',').map(id => id.trim()).filter(id => id !== "");
@@ -1255,7 +1263,7 @@ async function handleAdminConfigInput(userId, text, adminStateJson, env) {
                     successMsg = `✅ <b>备份群组 ID</b>已更新为：<code>${escapeHtml(finalValue)}</code>`; 
                 }
                 break;
-            // [新增] 协管员授权列表成功消息
+            // 协管员授权列表成功消息
             case 'authorized_admins': {
                 const authorizedAdmins = JSON.parse(finalValue);
                 if (authorizedAdmins.length === 0) {
@@ -1284,7 +1292,7 @@ async function handleAdminConfigInput(userId, text, adminStateJson, env) {
         // 备份群组 ID 菜单跳转
         } else if (adminState.key === 'backup_group_id') {
             nextMenuAction = 'config:menu:backup';
-        // [新增] 协管员授权列表菜单跳转
+        // 协管员授权列表菜单跳转
         } else if (adminState.key === 'authorized_admins') {
             nextMenuAction = 'config:menu:authorized';
         }
@@ -1299,7 +1307,7 @@ async function handleAdminConfigInput(userId, text, adminStateJson, env) {
         // 备份群组 ID 菜单跳转
         } else if (nextMenuAction === 'config:menu:backup') {
              await handleAdminBackupConfigMenu(userId, 0, env); 
-        // [新增] 协管员授权列表菜单跳转
+        // 协管员授权列表菜单跳转
         } else if (nextMenuAction === 'config:menu:authorized') {
              await handleAdminAuthorizedConfigMenu(userId, 0, env); 
         } else {
@@ -1419,7 +1427,7 @@ async function handleRelayToTopic(message, user, env) { // 接收 user 对象
         }
     }
 
-    // --- [优化 1] 向用户发送消息送达回执 ---
+    // --- 向用户发送消息送达回执 ---
     await telegramApi(env.BOT_TOKEN, "sendMessage", {
         chat_id: userId,
         text: "✅ 你的消息已发送给管理员，请耐心等待回复。",
@@ -1427,7 +1435,7 @@ async function handleRelayToTopic(message, user, env) { // 接收 user 对象
         disable_notification: true,
     }).catch(e => console.error("发送用户回执失败:", e.message)); // 忽略发送失败
 
-    // --- [优化 2] 更新用户的首次消息发送状态 ---
+    // --- 更新用户的首次消息发送状态 ---
     if (!user.first_message_sent) {
         await dbUserUpdate(userId, { first_message_sent: true }, env);
     }
@@ -1441,7 +1449,7 @@ async function handleRelayToTopic(message, user, env) { // 接收 user 对象
         await dbMessageDataPut(userId, message.message_id.toString(), messageData, env);
     }
     
-    // --- [新增] 消息备份转发逻辑 (合并为一条消息) ---
+    // --- 消息备份转发逻辑 (合并为一条消息) ---
     const backupGroupId = await getConfig('backup_group_id', env, "");
     if (backupGroupId) {
         // 提取用户资料，用于生成备份消息的标题
@@ -1547,7 +1555,6 @@ async function handleRelayToTopic(message, user, env) { // 接收 user 对象
             // 备份功能失败不应该影响主要转发流程，仅记录错误。
         }
     }
-    // --- [新增] 消息备份转发逻辑结束 ---
 }
 
 /**
@@ -1682,7 +1689,7 @@ async function handleCallbackQuery(callbackQuery, env) {
             // 备份群组菜单导航
             } else if (keyOrAction === 'backup') {
                 await handleAdminBackupConfigMenu(chatId, message.message_id, env);
-            // [新增] 协管员授权菜单导航
+            // 协管员授权菜单导航
             } else if (keyOrAction === 'authorized') {
                 await handleAdminAuthorizedConfigMenu(chatId, message.message_id, env);
             } else { // config:menu (主菜单)
@@ -1704,7 +1711,7 @@ async function handleCallbackQuery(callbackQuery, env) {
                 return;
             }
             
-            // [新增] 清除协管员授权列表的特殊处理
+            // 清除协管员授权列表的特殊处理
              if (keyOrAction === 'authorized_admins_clear') {
                 await dbConfigPut('authorized_admins', '[]', env); // 设置为空 JSON 数组
                 await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callbackQuery.id, text: `✅ 协管员授权列表已清空。`, show_alert: false });
@@ -1723,7 +1730,7 @@ async function handleCallbackQuery(callbackQuery, env) {
                 case 'block_threshold': prompt = "请发送**屏蔽次数阈值** (纯数字)："; break;
                 // 备份群组 ID 输入
                 case 'backup_group_id': prompt = "请发送**新的备份群组 ID 或用户名**："; break; 
-                // [新增] 协管员授权列表输入
+                // 协管员授权列表输入
                 case 'authorized_admins': prompt = "请发送**新的协管员 ID 或用户名列表**，多个请用逗号分隔 (例如：12345678, @username, 98765432)："; break;
                 default: return;
             }
@@ -1886,7 +1893,7 @@ async function handleAdminReply(message, env) {
     // 忽略机器人自己的消息
     if (message.from && message.from.is_bot) return;
 
-    // [新增] 检查消息发送者是否是授权协管员或主管理员
+    // 检查消息发送者是否是授权协管员或主管理员
     const senderId = message.from.id.toString();
     const isAuthorizedAdmin = await isAdminUser(senderId, env);
     
@@ -1896,7 +1903,6 @@ async function handleAdminReply(message, env) {
         return; 
     }
 
-
     const topicId = message.message_thread_id.toString();
     // 从 D1 根据 topic_id 查找 user_id
     const userId = await dbTopicUserGet(topicId, env);
@@ -1904,13 +1910,10 @@ async function handleAdminReply(message, env) {
 
     try {
         // 尝试直接 copyMessage
-        const fromChatId = message.chat.id;
-        const msgId = message.message_id;
-
         await telegramApi(env.BOT_TOKEN, "copyMessage", {
             chat_id: userId,
-            from_chat_id: fromChatId,
-            message_id: msgId,
+            from_chat_id: message.chat.id,
+            message_id: message.message_id,
         });
 
     } catch (e) {
@@ -1977,11 +1980,24 @@ async function handleAdminReply(message, env) {
         }
     }
     
-    // --- [优化 1] 向管理员发送消息送达回执 ---
+    // --- 向管理员发送带可点击用户名的回执 ---
+    // 首先获取完整的用户信息
+    const userData = await dbUserGetOrCreate(userId, env);
+    let confirmationDetail;
+
+    // 判断用户是否有用户名，构建不同的回执详情
+    if (userData.user_info && userData.user_info.username && userData.user_info.username !== '无') {
+        const safeUsername = escapeHtml(userData.user_info.username);
+        confirmationDetail = `用户名: <a href="tg://user?id=${userId}">${safeUsername}</a>`;
+    } else {
+        // 如果没有用户名，回退到显示ID
+        confirmationDetail = `ID: <code>${userId}</code>`;
+    }
+
     await telegramApi(env.BOT_TOKEN, "sendMessage", {
         chat_id: message.chat.id,
         message_thread_id: message.message_thread_id,
-        text: `✅ 回复已发送给用户 (ID: <code>${userId}</code>)`,
+        text: `✅ 回复已发送给用户 (${confirmationDetail})`,
         parse_mode: "HTML",
         reply_to_message_id: message.message_id,
         disable_notification: true,
